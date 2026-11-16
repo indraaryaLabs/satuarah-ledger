@@ -50,16 +50,20 @@ class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(problem);
     }
 
-    /** Framework-level failures (bad JSON, wrong type, missing parameter) are all invalid requests. */
+    /** Framework-level failures (bad JSON, wrong type, missing parameter, no such route) get a code too. */
     @Override
     protected ResponseEntity<Object> handleExceptionInternal(
             Exception ex, Object body, HttpHeaders headers, HttpStatusCode statusCode, WebRequest request) {
-        if (body instanceof ProblemDetail problem && problem.getProperties() == null) {
-            String code = statusCode.value() == 404
+        ResponseEntity<Object> response = super.handleExceptionInternal(ex, body, headers, statusCode, request);
+        if (response != null
+                && response.getBody() instanceof ProblemDetail problem
+                && (problem.getProperties() == null || !problem.getProperties().containsKey("code"))) {
+            int status = response.getStatusCode().value();
+            String code = status == 404
                     ? "NOT_FOUND"
-                    : statusCode.is4xxClientError() ? ErrorCode.INVALID_REQUEST.name() : "INTERNAL_ERROR";
+                    : status < 500 ? ErrorCode.INVALID_REQUEST.name() : "INTERNAL_ERROR";
             problem.setProperty("code", code);
         }
-        return super.handleExceptionInternal(ex, body, headers, statusCode, request);
+        return response;
     }
 }

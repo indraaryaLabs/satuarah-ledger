@@ -20,6 +20,7 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.core.NestedExceptionUtils;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -60,6 +61,11 @@ class PostgresInvariantsTest {
                         List.of(Posting.debit(cash, 1_000), Posting.credit(revenue, 1_000))))
                 .transaction()
                 .id();
+    }
+
+    private static String rootMessage(Throwable failure) {
+        Throwable cause = NestedExceptionUtils.getMostSpecificCause(failure);
+        return String.valueOf(cause.getMessage());
     }
 
     private void insertTransaction(UUID id) {
@@ -120,12 +126,12 @@ class PostgresInvariantsTest {
     @DisplayName("a transaction whose debits and credits differ cannot be committed")
     void unbalancedTransactionIsRefusedAtCommit() {
         UUID id = UUID.randomUUID();
-        DataAccessException failure = assertThrows(DataAccessException.class, () -> transaction.executeWithoutResult(s -> {
+        Exception failure = assertThrows(Exception.class, () -> transaction.executeWithoutResult(s -> {
             insertTransaction(id);
             insertLine(id, 1, cash, "DEBIT", 100);
             insertLine(id, 2, revenue, "CREDIT", 90);
         }));
-        assertTrue(failure.getMessage().contains("not balanced"), failure.getMessage());
+        assertTrue(rootMessage(failure).contains("not balanced"), rootMessage(failure));
         assertEquals(0L, jdbc.sql("select count(*) from ledger_transaction where id = ?").param(id).query(Long.class).single());
     }
 
@@ -133,22 +139,31 @@ class PostgresInvariantsTest {
     @DisplayName("a transaction with a single line cannot be committed")
     void singleLineIsRefused() {
         UUID id = UUID.randomUUID();
-        assertThrows(DataAccessException.class, () -> transaction.executeWithoutResult(s -> {
+        Exception failure = assertThrows(Exception.class, () -> transaction.executeWithoutResult(s -> {
             insertTransaction(id);
             insertLine(id, 1, cash, "DEBIT", 100);
         }));
+        assertTrue(rootMessage(failure).contains("fewer than two lines"), rootMessage(failure));
     }
 
     @Test
-    @DisplayName("a balanced transaction inserted by hand is accepted, one line at a time")
+    @DisplayName("a balanced transaction inserted by hand passes the check, one line at a time")
     void balancedRawTransactionIsAccepted() {
         UUID id = UUID.randomUUID();
-        transaction.executeWithoutResult(s -> {
+        Long lines = transaction.execute(status -> {
             insertTransaction(id);
             insertLine(id, 1, cash, "DEBIT", 100);
             insertLine(id, 2, revenue, "CREDIT", 100);
+            // Run the deferred check now instead of at commit, then undo it: the raw rows never
+            // touched the stored balances, so they must not stay in the shared ledger.
+            jdbc.sql("set constraints all immediate").update();
+            status.setRollbackOnly();
+            return jdbc.sql("select count(*) from ledger_entry where transaction_id = ?")
+                    .param(id)
+                    .query(Long.class)
+                    .single();
         });
-        assertEquals(2L, jdbc.sql("select count(*) from ledger_entry where transaction_id = ?").param(id).query(Long.class).single());
+        assertEquals(2L, lines);
     }
 
     @Test
@@ -157,12 +172,12 @@ class PostgresInvariantsTest {
         String dollars = "inv-usd-" + NEXT.incrementAndGet();
         ledger.openAccount(new NewAccount(dollars, "Dollars", AccountType.ASSET, "USD", false));
         UUID id = UUID.randomUUID();
-        DataAccessException failure = assertThrows(DataAccessException.class, () -> transaction.executeWithoutResult(s -> {
+        Exception failure = assertThrows(Exception.class, () -> transaction.executeWithoutResult(s -> {
             insertTransaction(id);
             insertLine(id, 1, dollars, "DEBIT", 100);
             insertLine(id, 2, revenue, "CREDIT", 100);
         }));
-        assertTrue(failure.getMessage().contains("mixes currencies"), failure.getMessage());
+        assertTrue(rootMessage(failure).contains("mixes currencies"), rootMessage(failure));
     }
 
     @Test
